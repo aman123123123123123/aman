@@ -1,0 +1,258 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Global Safety Net: Deny all access by default
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Reusable Hardened Primitives
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isValidPairingCodeId(code) {
+      return code is string && code.matches('^[0-9]{6}$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    // Validation Helpers
+    function isValidPairingCode(data) {
+      return data.childUid is string && data.childUid.size() >= 1 && data.childUid.size() <= 128 &&
+             data.deviceLabel is string && data.deviceLabel.size() >= 1 && data.deviceLabel.size() <= 40 &&
+             data.status in ['pending', 'claimed'] &&
+             (!('parentUid' in data) || (data.parentUid is string && data.parentUid.size() >= 1 && data.parentUid.size() <= 128)) &&
+             (!('linkId' in data) || (data.linkId is string && isValidId(data.linkId))) &&
+             data.createdAt is timestamp && data.createdAt <= request.time &&
+             data.updatedAt is timestamp && data.updatedAt <= request.time;
+    }
+
+    function isValidFamilyLink(data) {
+      return data.parentUid is string && data.parentUid.size() >= 1 && data.parentUid.size() <= 128 &&
+             data.childUid is string && data.childUid.size() >= 1 && data.childUid.size() <= 128 &&
+             data.memberUids is list && data.memberUids.size() >= 1 && data.memberUids.size() <= 2 &&
+             data.memberUids[0] is string &&
+             data.parentUid in data.memberUids &&
+             data.childUid in data.memberUids &&
+             data.childName is string && data.childName.size() >= 1 && data.childName.size() <= 40 &&
+             data.pairingCode is string && isValidPairingCodeId(data.pairingCode) &&
+             data.parentPin is string && data.parentPin.size() <= 10 &&
+             data.activeRequestType in ['none', 'camera_checkin', 'screen_share'] &&
+             (!('activeRequestAt' in data) || (data.activeRequestAt is timestamp && data.activeRequestAt <= request.time)) &&
+             data.childBatteryPercent is int && data.childBatteryPercent >= 0 && data.childBatteryPercent <= 100 &&
+             data.childCharging is bool &&
+             data.childStatusText is string && data.childStatusText.size() <= 120 &&
+             data.cameraSharingActive is bool &&
+             data.screenSharingActive is bool &&
+             data.createdAt is timestamp && data.createdAt <= request.time &&
+             data.updatedAt is timestamp && data.updatedAt <= request.time;
+    }
+
+    function isValidFamilyMessage(data) {
+      return data.parentUid is string && data.parentUid.size() >= 1 && data.parentUid.size() <= 128 &&
+             data.childUid is string && data.childUid.size() >= 1 && data.childUid.size() <= 128 &&
+             data.memberUids is list && data.memberUids.size() >= 1 && data.memberUids.size() <= 2 &&
+             data.memberUids[0] is string &&
+             data.parentUid in data.memberUids &&
+             data.childUid in data.memberUids &&
+             data.senderUid is string && data.senderUid.size() >= 1 && data.senderUid.size() <= 128 &&
+             data.senderRole in ['parent', 'child'] &&
+             data.title is string && data.title.size() >= 1 && data.title.size() <= 80 &&
+             data.body is string && data.body.size() >= 1 && data.body.size() <= 500 &&
+             data.acknowledged is bool &&
+             data.createdAt is timestamp && data.createdAt <= request.time &&
+             data.updatedAt is timestamp && data.updatedAt <= request.time;
+    }
+
+    function isValidCheckinFrame(data) {
+      return data.parentUid is string && data.parentUid.size() >= 1 && data.parentUid.size() <= 128 &&
+             data.childUid is string && data.childUid.size() >= 1 && data.childUid.size() <= 128 &&
+             data.memberUids is list && data.memberUids.size() >= 1 && data.memberUids.size() <= 2 &&
+             data.memberUids[0] is string &&
+             data.parentUid in data.memberUids &&
+             data.childUid in data.memberUids &&
+             data.kind in ['camera', 'screen'] &&
+             data.imageBase64 is string && data.imageBase64.size() >= 1 && data.imageBase64.size() <= 250000 &&
+             data.caption is string && data.caption.size() <= 120 &&
+             data.createdAt is timestamp && data.createdAt <= request.time;
+    }
+
+    // 1. Pairing Codes (Single-doc lookup by 6-digit code only; listing forbidden)
+    match /pairingCodes/{code} {
+      allow get: if isSignedIn() && isValidPairingCodeId(code);
+      allow list: if false;
+
+      allow create: if isSignedIn() &&
+                       isValidPairingCodeId(code) &&
+                       incoming().childUid == request.auth.uid &&
+                       incoming().status == 'pending' &&
+                       !('parentUid' in incoming()) &&
+                       !('linkId' in incoming()) &&
+                       incoming().keys().hasAll(['childUid', 'deviceLabel', 'status', 'createdAt', 'updatedAt']) &&
+                       incoming().keys().hasOnly(['childUid', 'deviceLabel', 'status', 'createdAt', 'updatedAt']) &&
+                       isValidPairingCode(incoming());
+
+      allow update: if isSignedIn() &&
+                       isValidPairingCodeId(code) &&
+                       isValidPairingCode(incoming()) &&
+                       incoming().childUid == existing().childUid &&
+                       incoming().createdAt == existing().createdAt &&
+                       existing().status == 'pending' &&
+                       incoming().status == 'claimed' &&
+                       incoming().parentUid == request.auth.uid &&
+                       ('linkId' in incoming()) &&
+                       isValidId(incoming().linkId) &&
+                       incoming().diff(existing()).affectedKeys().hasOnly(['status', 'parentUid', 'linkId', 'updatedAt']);
+
+      allow delete: if isSignedIn() &&
+                       isValidPairingCodeId(code) &&
+                       existing().childUid == request.auth.uid;
+    }
+
+    // 2. Family Links & Subcollections
+    match /family_links/{linkId} {
+      allow get: if isSignedIn() &&
+                    isValidId(linkId) &&
+                    (request.auth.uid == existing().parentUid || request.auth.uid == existing().childUid);
+
+      allow list: if isSignedIn() && request.auth.uid in resource.data.memberUids;
+
+      allow create: if isSignedIn() &&
+                       isValidId(linkId) &&
+                       incoming().parentUid == request.auth.uid &&
+                       incoming().keys().hasAll([
+                         'parentUid', 'childUid', 'memberUids', 'childName', 'pairingCode',
+                         'parentPin', 'activeRequestType', 'childBatteryPercent', 'childCharging',
+                         'childStatusText', 'cameraSharingActive', 'screenSharingActive',
+                         'createdAt', 'updatedAt'
+                       ]) &&
+                       incoming().keys().hasOnly([
+                         'parentUid', 'childUid', 'memberUids', 'childName', 'pairingCode',
+                         'parentPin', 'activeRequestType', 'activeRequestAt', 'childBatteryPercent',
+                         'childCharging', 'childStatusText', 'cameraSharingActive',
+                         'screenSharingActive', 'createdAt', 'updatedAt'
+                       ]) &&
+                       isValidFamilyLink(incoming()) &&
+                       exists(/databases/$(database)/documents/pairingCodes/$(incoming().pairingCode)) &&
+                       get(/databases/$(database)/documents/pairingCodes/$(incoming().pairingCode)).data.childUid == incoming().childUid &&
+                       get(/databases/$(database)/documents/pairingCodes/$(incoming().pairingCode)).data.parentUid == request.auth.uid &&
+                       get(/databases/$(database)/documents/pairingCodes/$(incoming().pairingCode)).data.status == 'claimed';
+
+      allow update: if isSignedIn() &&
+                       isValidId(linkId) &&
+                       isValidFamilyLink(incoming()) &&
+                       incoming().parentUid == existing().parentUid &&
+                       incoming().childUid == existing().childUid &&
+                       incoming().memberUids == existing().memberUids &&
+                       incoming().pairingCode == existing().pairingCode &&
+                       incoming().createdAt == existing().createdAt && (
+                         // Action A: Parent updates child name, PIN, or sends check-in request
+                         (request.auth.uid == existing().parentUid &&
+                          incoming().diff(existing()).affectedKeys().hasOnly([
+                            'childName', 'parentPin', 'activeRequestType', 'activeRequestAt', 'updatedAt'
+                          ])) ||
+                         // Action B: Child updates battery, status, or transparent sharing flags
+                         (request.auth.uid == existing().childUid &&
+                          incoming().diff(existing()).affectedKeys().hasOnly([
+                            'activeRequestType', 'childBatteryPercent', 'childCharging',
+                            'childStatusText', 'cameraSharingActive', 'screenSharingActive', 'updatedAt'
+                          ]))
+                       );
+
+      allow delete: if isSignedIn() &&
+                       isValidId(linkId) &&
+                       request.auth.uid == existing().parentUid;
+
+      match /messages/{messageId} {
+        allow get: if isSignedIn() &&
+                      isValidId(linkId) &&
+                      isValidId(messageId) &&
+                      (request.auth.uid == existing().parentUid || request.auth.uid == existing().childUid);
+
+        allow list: if isSignedIn() && request.auth.uid in resource.data.memberUids;
+
+        allow create: if isSignedIn() &&
+                         isValidId(linkId) &&
+                         isValidId(messageId) &&
+                         incoming().senderUid == request.auth.uid &&
+                         request.auth.uid in incoming().memberUids &&
+                         incoming().keys().hasAll([
+                           'parentUid', 'childUid', 'memberUids', 'senderUid',
+                           'senderRole', 'title', 'body', 'acknowledged', 'createdAt', 'updatedAt'
+                         ]) &&
+                         incoming().keys().hasOnly([
+                           'parentUid', 'childUid', 'memberUids', 'senderUid',
+                           'senderRole', 'title', 'body', 'acknowledged', 'createdAt', 'updatedAt'
+                         ]) &&
+                         isValidFamilyMessage(incoming()) &&
+                         exists(/databases/$(database)/documents/family_links/$(linkId)) &&
+                         get(/databases/$(database)/documents/family_links/$(linkId)).data.parentUid == incoming().parentUid &&
+                         get(/databases/$(database)/documents/family_links/$(linkId)).data.childUid == incoming().childUid;
+
+        allow update: if isSignedIn() &&
+                         isValidId(linkId) &&
+                         isValidId(messageId) &&
+                         request.auth.uid in existing().memberUids &&
+                         isValidFamilyMessage(incoming()) &&
+                         incoming().parentUid == existing().parentUid &&
+                         incoming().childUid == existing().childUid &&
+                         incoming().memberUids == existing().memberUids &&
+                         incoming().senderUid == existing().senderUid &&
+                         incoming().senderRole == existing().senderRole &&
+                         incoming().title == existing().title &&
+                         incoming().body == existing().body &&
+                         incoming().createdAt == existing().createdAt &&
+                         incoming().diff(existing()).affectedKeys().hasOnly(['acknowledged', 'updatedAt']);
+
+        allow delete: if isSignedIn() &&
+                         isValidId(linkId) &&
+                         isValidId(messageId) &&
+                         request.auth.uid == existing().parentUid;
+      }
+
+      match /checkins/{checkinId} {
+        allow get: if isSignedIn() &&
+                      isValidId(linkId) &&
+                      isValidId(checkinId) &&
+                      (request.auth.uid == existing().parentUid || request.auth.uid == existing().childUid);
+
+        allow list: if isSignedIn() && request.auth.uid in resource.data.memberUids;
+
+        allow create: if isSignedIn() &&
+                         isValidId(linkId) &&
+                         isValidId(checkinId) &&
+                         incoming().childUid == request.auth.uid &&
+                         request.auth.uid in incoming().memberUids &&
+                         incoming().keys().hasAll([
+                           'parentUid', 'childUid', 'memberUids', 'kind', 'imageBase64', 'caption', 'createdAt'
+                         ]) &&
+                         incoming().keys().hasOnly([
+                           'parentUid', 'childUid', 'memberUids', 'kind', 'imageBase64', 'caption', 'createdAt'
+                         ]) &&
+                         isValidCheckinFrame(incoming()) &&
+                         exists(/databases/$(database)/documents/family_links/$(linkId)) &&
+                         get(/databases/$(database)/documents/family_links/$(linkId)).data.childUid == request.auth.uid &&
+                         get(/databases/$(database)/documents/family_links/$(linkId)).data.parentUid == incoming().parentUid;
+
+        allow update: if false;
+
+        allow delete: if isSignedIn() &&
+                         isValidId(linkId) &&
+                         isValidId(checkinId) &&
+                         (request.auth.uid == existing().parentUid || request.auth.uid == existing().childUid);
+      }
+    }
+  }
+}
